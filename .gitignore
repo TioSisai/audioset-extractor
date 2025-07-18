@@ -1,0 +1,10 @@
+/.vscode/
+/metadata/
+/metadata_backup/
+/build/
+**/*.z*
+/logs/
+/backup/
+*.log
+*.DS_Store
+/tests/
