@@ -188,6 +188,15 @@ def _extract_files(stem_to_archive_and_innerfile: dict[str, tuple[str, str]], st
 
     logger.info(f"Successfully extracted {extracted_cnt} audio files.")
 
+
+def _rename_audios_in_directory(directory: Path) -> None:
+    for audio_file in directory.glob("*.wav"):
+        orig_name = audio_file.name
+        # Remove the 'Y' prefix from the archive file provided by PANNs repository, which is not as the same as Google's Documentation.
+        new_name = orig_name[1:]
+        new_path = audio_file.parent / new_name
+        audio_file.rename(new_path)
+
 # ============================== Public API ==============================
 
 
@@ -372,4 +381,5 @@ def process_entry(entry: str) -> None:
             f.write(f"{stem}.wav\n")
     logger.info(f"Recorded missing audio files for {entry} to {LOG_ROOT / f'{entry}_missing_files.log'}")
     _extract_files(stem_to_archive_and_innerfile, list(intersection_stems), entry)
+    _rename_audios_in_directory(AUDIO_ROOT / entry)
     logger.info(f"Audio files for {entry} have been extracted to {AUDIO_ROOT / entry}")
