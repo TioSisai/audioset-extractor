@@ -8,3 +8,6 @@
 *.log
 *.DS_Store
 /tests/
+**/__pycache__/
+/pickles/
+/audio/
