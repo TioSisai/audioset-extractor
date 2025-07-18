@@ -55,7 +55,7 @@ audioset-extractor/
 ## Usage
 
 1.  **Download Archive Files**
-    Download the Audioset archive files from the [PANNs provided archival URL](https://github.com/qiuqiangkong/audioset_tagging_cnn#1-download-dataset) and place its inner `zip_audios/` folder into the project root directory.
+    Download the Audioset archive files from the [PANNs provided archival URL (Their Baidu Cloud disk link)](https://github.com/qiuqiangkong/audioset_tagging_cnn#1-download-dataset) and place its inner `zip_audios/` folder into the project root directory.
 
 2.  **Run the Extraction Script**
     Open a terminal, use `scripts/extract.py`, and specify the datasets to extract via command-line arguments.
