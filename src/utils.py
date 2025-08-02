@@ -9,6 +9,11 @@ import shutil
 import subprocess
 from collections import defaultdict
 from pathlib import Path
+import json
+import re
+from multiprocessing import Pool, cpu_count
+from typing import Union, Dict, Tuple
+from functools import partial
 
 # ============================== Third-party Libraries ==============================
 import pandas as pd
@@ -23,14 +28,14 @@ PROJECT_ROOT = rootutils.find_root(__file__, indicator=".project-root")
 PICKLE_ROOT = PROJECT_ROOT / "pickles"
 METADATA_ROOT = PROJECT_ROOT / "metadata"
 ZIP_ROOT = PROJECT_ROOT / "zip_audios"
-LOG_ROOT = PROJECT_ROOT / "logs"
+MISSING_ROOT = PROJECT_ROOT / "missing_files"
 AUDIO_ROOT = PROJECT_ROOT / "audio"
 
 
 # ============================== Module Initialization ==============================
 def _initialize_directories() -> None:
     """Creates global directories required for the project."""
-    for path in [PICKLE_ROOT, METADATA_ROOT, ZIP_ROOT, LOG_ROOT, AUDIO_ROOT]:
+    for path in [PICKLE_ROOT, METADATA_ROOT, ZIP_ROOT, MISSING_ROOT, AUDIO_ROOT]:
         path.mkdir(parents=True, exist_ok=True)
 
 
@@ -74,6 +79,11 @@ def _proc_single_archive(archive_path: str | Path, left_strip: int | None = None
                 if line.endswith(".wav"):
                     # 7z output is fixed-width, filename is in the last part
                     innerfile = line.split()[-1]
+                    filesize = int(line.split()[-3])
+                    # Skip files smaller than 1KB
+                    if filesize < 1000:
+                        pbar.update(1)
+                        continue
                     # Core logic: extract filename stem from the inner file path.
                     # Example: "folder/audio_01.wav" -> "audio_01"
                     # left_strip is used to remove specific characters from the beginning of the stem.
@@ -197,10 +207,94 @@ def _rename_audios_in_directory(directory: Path) -> None:
         new_path = audio_file.parent / new_name
         audio_file.rename(new_path)
 
-# ============================== Public API ==============================
+
+def _check_audio_file_worker(
+    audio_file: Path,
+    min_duration: float,
+    silence_db_threshold: float
+) -> Union[Tuple[str, str], None]:
+    """
+    Worker function to check a single audio file.
+
+    Returns:
+        A tuple (filename, reason_string) if any check fails, otherwise None.
+    """
+    # 检查文件是否存在
+    if not audio_file.exists():
+        return (audio_file.name, "File not found")
+
+    # --- 步骤 1: 使用 ffprobe 进行元数据验证 ---
+    try:
+        command_info = [
+            "ffprobe", "-v", "quiet", "-print_format", "json",
+            "-show_format", "-show_streams", str(audio_file)
+        ]
+        result_info = subprocess.run(
+            command_info, capture_output=True, text=True, check=True, encoding="utf-8"
+        )
+        data = json.loads(result_info.stdout)
+
+        # 检查 2: 时长
+        duration = float(data.get("format", {}).get("duration", "0"))
+        if duration < min_duration:
+            reason = f"Duration too short: {duration:.2f}s"
+            logger.debug(f"'{audio_file.name}' failed duration check. Reason: {reason}")
+            return (audio_file.name, reason)
+
+        # 检查 3 (严谨): 验证容器和编码
+        format_name = data.get("format", {}).get("format_name", "")
+        audio_stream = next((s for s in data.get("streams", []) if s.get("codec_type") == "audio"), None)
+        codec_name = audio_stream.get("codec_name", "") if audio_stream else ""
+
+        if "wav" not in format_name or "pcm" not in codec_name:
+            reason = f"Invalid format (container: '{format_name}', codec: '{codec_name}')"
+            logger.debug(f"'{audio_file.name}' failed format check. Reason: {reason}")
+            return (audio_file.name, reason)
+
+    except subprocess.CalledProcessError as e:
+        reason = f"Corrupted or unreadable file. Stderr: {e.stderr.strip()}"
+        logger.warning(f"ffprobe could not read '{audio_file.name}'. Reason: {reason}")
+        return (audio_file.name, reason)
+    except (json.JSONDecodeError, KeyError, ValueError):
+        reason = "Failed to parse ffprobe output"
+        logger.warning(f"Could not parse ffprobe output for '{audio_file.name}'.")
+        return (audio_file.name, reason)
+    except FileNotFoundError:
+        logger.error("ffprobe command not found. Please ensure ffmpeg is installed in your PATH.")
+        raise
+
+    # --- 步骤 2: 使用 ffmpeg 的 volumedetect 进行静音检测 ---
+    try:
+        command_volume = [
+            "ffmpeg", "-i", str(audio_file), "-af", "volumedetect",
+            "-vn", "-f", "null", "-",
+        ]
+        result_volume = subprocess.run(
+            command_volume, capture_output=True, text=True, encoding="utf-8"
+        )
+        output = result_volume.stderr
+
+        max_volume_match = re.search(r"max_volume:\s*(-?[\d\.]+) dB", output)
+        if not max_volume_match:
+            reason = "Could not determine max_volume"
+            logger.warning(f"'{audio_file.name}' failed volume detection. Reason: {reason}")
+            return (audio_file.name, reason)
+
+        max_volume = float(max_volume_match.group(1))
+        if max_volume < silence_db_threshold:
+            reason = f"Silent file: max_volume is {max_volume:.1f} dB"
+            logger.debug(f"'{audio_file.name}' failed silence check. Reason: {reason}")
+            return (audio_file.name, reason)
+
+    except FileNotFoundError:
+        logger.error("ffmpeg command not found. Please ensure ffmpeg is installed in your PATH.")
+        raise
+
+    # 所有检查通过
+    return None
 
 
-def archive_files_under(zip_root: Path) -> list[Path]:
+def _archive_files_under(zip_root: Path) -> list[Path]:
     """
     Gets all archive files under the specified directory.
 
@@ -216,7 +310,7 @@ def archive_files_under(zip_root: Path) -> list[Path]:
     return list(zip_root.glob("*.zip"))
 
 
-def download_url(url: str, dest: str | Path) -> None:
+def _download_url(url: str, dest: str | Path) -> None:
     """
     Downloads a file from the specified URL to the target path.
 
@@ -256,7 +350,7 @@ def download_url(url: str, dest: str | Path) -> None:
         raise FileNotFoundError(f"Please install the {avail_dl} command-line tool to download files.")
 
 
-def download_all_metafiles():
+def _download_all_metafiles():
     """Downloads all required metadata files."""
     download_urls: list[str] = [
         "http://storage.googleapis.com/us_audioset/youtube_corpus/v1/csv/eval_segments.csv",
@@ -278,11 +372,11 @@ def download_all_metafiles():
         dest_path = METADATA_ROOT / file_name
         if not dest_path.exists():
             logger.info(f"Starting download of {file_name} to {dest_path}...")
-            download_url(file_url, dest_path)
+            _download_url(file_url, dest_path)
             logger.info(f"{file_name} download complete.")
 
 
-def prepare_all_pickles():
+def _prepare_all_pickles():
     """Prepares all required pickle files, mainly mappings of audio file paths."""
     PICKLE_ROOT.mkdir(parents=True, exist_ok=True)
     stem_to_archive_and_innerfile: dict[str, tuple[str, str]] = {}
@@ -294,7 +388,7 @@ def prepare_all_pickles():
     else:
         logger.info("stem_to_archive_and_innerfile.pkl does not exist, starting processing.")
 
-        unbalanced_archive_files = archive_files_under(ZIP_ROOT / "unbalanced_train_segments")
+        unbalanced_archive_files = _archive_files_under(ZIP_ROOT / "unbalanced_train_segments")
         unbalanced_stem_to_archive_and_innerfile: dict[str, tuple[str, str]] = {}
         for unbalanced_archive_file in unbalanced_archive_files:
             unbalanced_stem_to_archive_and_innerfile.update(_proc_single_archive(unbalanced_archive_file, left_strip=1))
@@ -324,6 +418,62 @@ def prepare_all_pickles():
     return stem_to_archive_and_innerfile
 
 
+def _invalid_directory(
+    directory_path: Union[str, Path],
+    num_workers: int = None,
+    min_duration: float = 0.5,
+    silence_db_threshold: float = -60.0
+) -> Dict[str, str]:
+    """
+    Checks all .wav files in a directory in parallel.
+
+    Args:
+        directory_path: The path to the directory containing .wav files.
+        num_workers: The number of processes to use. Defaults to the number of CPU cores.
+        min_duration: Minimum required duration in seconds.
+        silence_db_threshold: The noise tolerance in dB for silence detection.
+
+    Returns:
+        A dictionary where keys are failed filenames and values are the reasons for failure.
+    """
+    directory_path = Path(directory_path)
+    if not directory_path.is_dir():
+        logger.error(f"Provided path is not a directory: {directory_path}")
+        return {}
+
+    files_to_check = list(directory_path.glob("*.wav"))
+
+    if not files_to_check:
+        logger.info(f"No .wav files found in directory: {directory_path}")
+        return {}
+
+    # If num_workers is not specified, use all available CPU cores
+    workers = num_workers or cpu_count()
+    logger.info(f"Found {len(files_to_check)} .wav files. Starting validation with {workers} workers...")
+
+    worker_func = partial(
+        _check_audio_file_worker,
+        min_duration=min_duration,
+        silence_db_threshold=silence_db_threshold
+    )
+
+    failed_files_map = {}
+    with Pool(processes=workers) as pool:
+        results_iterator = pool.imap_unordered(worker_func, files_to_check)
+
+        for result in tqdm(results_iterator, total=len(files_to_check), desc="Validating files"):
+            if result is not None:
+                filename, reason = result
+                failed_files_map[filename] = reason
+
+    logger.info(f"Validation complete. Found {len(failed_files_map)} problematic files.")
+    for item_filename, item_reason in failed_files_map.items():
+        logger.info(f"{item_filename}: {item_reason}")
+    return failed_files_map
+
+
+# ============================== Public API ==============================
+
 def process_entry(entry: str) -> None:
     """
     Processes the specified dataset entry.
@@ -346,8 +496,8 @@ def process_entry(entry: str) -> None:
         "strong_eval",
     ], f"Invalid processing option: {entry}"
 
-    download_all_metafiles()
-    stem_to_archive_and_innerfile = prepare_all_pickles()
+    _download_all_metafiles()
+    stem_to_archive_and_innerfile = _prepare_all_pickles()
 
     entry_meta_map: dict[str, Path] = {
         "weak_unbalanced_train": METADATA_ROOT / "unbalanced_train_segments.csv",
@@ -370,16 +520,21 @@ def process_entry(entry: str) -> None:
 
     downloaded_stems = set(stem_to_archive_and_innerfile.keys())
     intersection_stems = unique_stems.intersection(downloaded_stems)
-    logger.info(f"In {metafile.name}:")
-    logger.info(f"	Found {len(unique_stems)} audio files.")
-    logger.info(f"	Downloaded {len(intersection_stems)} audio files.")
-    logger.info(
-        f"	Missing {len(unique_stems - intersection_stems)} audio files, missing rate: {len(unique_stems - intersection_stems) / len(unique_stems):.2%}"
-    )
-    with open(LOG_ROOT / f"{entry}_missing_files.log", "w") as f:
-        for stem in unique_stems - intersection_stems:
-            f.write(f"{stem}.wav\n")
-    logger.info(f"Recorded missing audio files for {entry} to {LOG_ROOT / f'{entry}_missing_files.log'}")
+    logger.info(f"Starting extraction for {entry}...")
     _extract_files(stem_to_archive_and_innerfile, list(intersection_stems), entry)
-    _rename_audios_in_directory(AUDIO_ROOT / entry)
-    logger.info(f"Audio files for {entry} have been extracted to {AUDIO_ROOT / entry}")
+    logger.info(f"Extraction for {entry} completed.")
+    logger.info(f"Starting to check invalid or broken audio files for {entry}...")
+    invalid_file_reason_map: dict = _invalid_directory(AUDIO_ROOT / entry, num_workers=None)
+    logger.info(f"Invalid file check for {entry} completed.")
+    # logger.info(f"In {metafile.name}:")
+    # logger.info(f"	Found {len(unique_stems)} audio files.")
+    # logger.info(f"	Downloaded {len(intersection_stems)} audio files.")
+    # logger.info(
+    #     f"	Missing {len(unique_stems - intersection_stems)} audio files, missing rate: {len(unique_stems - intersection_stems) / len(unique_stems):.2%}"
+    # )
+    # with open(MISSING_ROOT / f"{entry}.txt", "w") as f:
+    #     for stem in unique_stems - intersection_stems:
+    #         f.write(f"{stem}.wav\n")
+    # logger.info(f"Recorded missing audio files for {entry} to {MISSING_ROOT / f'{entry}.txt'}")
+    # _rename_audios_in_directory(AUDIO_ROOT / entry)
+    # logger.info(f"Audio files for {entry} have been extracted to {AUDIO_ROOT / entry}")
