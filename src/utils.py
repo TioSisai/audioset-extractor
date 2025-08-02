@@ -308,7 +308,8 @@ def _rename_audios_in_directory(directory: Path) -> None:
 def _check_audio_file_worker(
     audio_file: Path,
     min_duration: float = None,
-    silence_db_threshold: float = None
+    silence_db_threshold: float = None,
+    valid_silent_files: list[str] = []
 ) -> Union[Tuple[str, str], None]:
     """
     Worker function to check a single audio file.
@@ -383,7 +384,7 @@ def _check_audio_file_worker(
                 return (audio_file.name, reason)
 
             max_volume = float(max_volume_match.group(1))
-            if max_volume < silence_db_threshold:
+            if max_volume < silence_db_threshold and audio_file.name not in valid_silent_files:
                 reason = f"Silent file: max_volume is {max_volume:.1f} dB"
                 logger.debug(f"'{audio_file.name}' failed silence check. Reason: {reason}")
                 return (audio_file.name, reason)
@@ -524,7 +525,8 @@ def _invalid_directory(
     directory_path: Union[str, Path],
     num_workers: int = None,
     min_duration: float = None,
-    silence_db_threshold: float = None
+    silence_db_threshold: float = None,
+    valid_silent_files: list[str] = []
 ) -> Dict[str, str]:
     """
     Checks all .wav files in a directory in parallel.
@@ -556,7 +558,8 @@ def _invalid_directory(
     worker_func = partial(
         _check_audio_file_worker,
         min_duration=min_duration,
-        silence_db_threshold=silence_db_threshold
+        silence_db_threshold=silence_db_threshold,
+        valid_silent_files=valid_silent_files
     )
 
     failed_files_map = {}
@@ -572,6 +575,18 @@ def _invalid_directory(
     for item_filename, item_reason in failed_files_map.items():
         logger.info(f"{item_filename}: {item_reason}")
     return failed_files_map
+
+
+def _get_meta_df(metafile: str | Path) -> pd.DataFrame:
+    metafile = Path(metafile)
+    if "strong" in metafile.stem:
+        meta_df = pd.read_csv(metafile, sep="\t")
+        meta_df["segment_id"] = meta_df["segment_id"].apply(lambda x: x.rsplit("_", maxsplit=1)[0])
+        meta_df.rename(columns={"segment_id": "stem", "label": "mid"}, inplace=True)
+    else:
+        meta_df = pd.read_csv(metafile, sep=", ", header=2, engine="python")
+        meta_df.rename(columns={"# YTID": "stem", "positive_labels": "mid"}, inplace=True)
+    return meta_df
 
 
 # ============================== Public API ==============================
@@ -624,14 +639,16 @@ def process_entry(entry: str, num_workers: int = None, min_duration: float = Non
 
     metafile = entry_meta_map.get(entry)
 
-    if "strong_" in entry:
-        df = pd.read_csv(metafile, sep="\t", engine="python")
-        unique_filenames = df.iloc[:, 0].unique().tolist()
-        unique_stems = set([item.rsplit("_", maxsplit=1)[0] for item in unique_filenames])
+    df = _get_meta_df(metafile)
+    unique_stems = set(df["stem"].unique().tolist())
+
+    # 找到df中所有"mid"中包含有"/m/028v0c"的行, 即"Silence"标签对应的行
+    valid_silent_files = [item + ".wav" for item in df[df["mid"].str.contains("/m/028v0c")]["stem"].unique().tolist()]
+    if valid_silent_files:
+        logger.info(f"Found {len(valid_silent_files)} valid silent files in {metafile.name}.")
     else:
-        df = pd.read_csv(metafile, header=2, sep=", ", engine="python")
-        unique_filenames = df.iloc[:, 0].unique().tolist()
-        unique_stems = set(unique_filenames)
+        valid_silent_files = []
+        logger.info(f"No valid silent files found in {metafile.name}.")
 
     downloaded_stems = set(stem_to_archive_and_innerfile.keys())
     intersection_stems = unique_stems.intersection(downloaded_stems)
@@ -639,17 +656,20 @@ def process_entry(entry: str, num_workers: int = None, min_duration: float = Non
     _extract_files(stem_to_archive_and_innerfile, list(intersection_stems), entry)
     logger.info(f"Extraction for {entry} completed.")
 
+    _rename_audios_in_directory(AUDIO_ROOT / entry)
+
     logger.info(f"Starting to check invalid or broken audio files for {entry}...")
     invalid_file_reason_map: dict = _invalid_directory(AUDIO_ROOT / entry, num_workers=num_workers,
                                                        min_duration=min_duration,
-                                                       silence_db_threshold=silence_db_threshold)
+                                                       silence_db_threshold=silence_db_threshold,
+                                                       valid_silent_files=valid_silent_files)
 
     # Move invalid files to the INVALID_ROOT directory
     for invalid_file in invalid_file_reason_map.keys():
         invalid_file_path = AUDIO_ROOT / entry / invalid_file
-        invalid_file_path.rename(INVALID_ROOT / entry / invalid_file[1:])
+        invalid_file_path.rename(INVALID_ROOT / entry / invalid_file)
 
-    invalid_stems = set([invalid_item[1:].rstrip(".wav") for invalid_item in list(invalid_file_reason_map.keys())])
+    invalid_stems = set([invalid_item.rstrip(".wav") for invalid_item in list(invalid_file_reason_map.keys())])
     valid_and_existing_stems = intersection_stems - invalid_stems
     logger.info(f"Invalid file check for {entry} completed.")
 
@@ -664,7 +684,5 @@ def process_entry(entry: str, num_workers: int = None, min_duration: float = Non
         for stem in unique_stems - valid_and_existing_stems:
             f.write(f"{stem}.wav\n")
     logger.info(f"Recorded missing audio files for {entry} to {MISSING_ROOT / f'{entry}.txt'}")
-
-    _rename_audios_in_directory(AUDIO_ROOT / entry)
 
     logger.info(f"Audio files for {entry} have been extracted to {AUDIO_ROOT / entry}")
