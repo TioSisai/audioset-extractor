@@ -31,19 +31,18 @@ METADATA_ROOT = PROJECT_ROOT / "metadata"
 ZIP_ROOT = PROJECT_ROOT / "zip_audios"
 MISSING_ROOT = PROJECT_ROOT / "missing_files"
 AUDIO_ROOT = PROJECT_ROOT / "audio"
-
-
-# ============================== Module Initialization ==============================
-def _initialize_directories() -> None:
-    """Creates global directories required for the project."""
-    for path in [PICKLE_ROOT, METADATA_ROOT, ZIP_ROOT, MISSING_ROOT, AUDIO_ROOT]:
-        path.mkdir(parents=True, exist_ok=True)
-
-
-_initialize_directories()
+INVALID_ROOT = PROJECT_ROOT / "invalid_audio"
 
 
 # ============================== Private Implementations ==============================
+def _initialize_directories(entry: str) -> None:
+    """Creates global directories required for the project."""
+    for path in [PICKLE_ROOT, METADATA_ROOT, ZIP_ROOT, MISSING_ROOT, AUDIO_ROOT, INVALID_ROOT]:
+        path.mkdir(parents=True, exist_ok=True)
+    (AUDIO_ROOT / entry).mkdir(parents=True, exist_ok=True)
+    (INVALID_ROOT / entry).mkdir(parents=True, exist_ok=True)
+
+
 def _proc_single_archive(archive_path: str | Path, left_strip: int = 1) -> dict[str, tuple[str, str]]:
     """
     Lists .wav files within an archive using p7zip.
@@ -126,7 +125,6 @@ def _proc_single_archive(archive_path: str | Path, left_strip: int = 1) -> dict[
 #     logger.info(f"Starting audio file extraction...")
 #     extracted_cnt = 0
 #     target_dir = AUDIO_ROOT / entry
-#     target_dir.mkdir(parents=True, exist_ok=True)
 #     target_dir = str(target_dir)
 #     with tqdm.tqdm(total=len(stems), desc="Extracting audio files", unit="file") as pbar:
 #         for stem in stems:
@@ -176,7 +174,6 @@ def _proc_single_archive(archive_path: str | Path, left_strip: int = 1) -> dict[
 
 #     # 2. Create target directory
 #     target_dir = AUDIO_ROOT / entry
-#     target_dir.mkdir(parents=True, exist_ok=True)
 
 #     # 3. Execute one 7z command per archive
 #     extracted_cnt = 0
@@ -272,7 +269,6 @@ def _extract_files(
 
     # 2. Create target directory (logic unchanged).
     target_dir = AUDIO_ROOT / entry
-    target_dir.mkdir(parents=True, exist_ok=True)
 
     # 3. Prepare task list for the multiprocessing pool.
     # Each task is a tuple containing (archive path, file list, target directory).
@@ -609,7 +605,10 @@ def process_entry(entry: str) -> None:
         "strong_eval",
     ], f"Invalid processing option: {entry}"
 
+    _initialize_directories(entry)
+
     _download_all_metafiles()
+
     stem_to_archive_and_innerfile = _prepare_all_pickles()
 
     entry_meta_map: dict[str, Path] = {
@@ -636,24 +635,31 @@ def process_entry(entry: str) -> None:
     logger.info(f"Starting extraction for {entry}...")
     _extract_files(stem_to_archive_and_innerfile, list(intersection_stems), entry)
     logger.info(f"Extraction for {entry} completed.")
+
     logger.info(f"Starting to check invalid or broken audio files for {entry}...")
     invalid_file_reason_map: dict = _invalid_directory(AUDIO_ROOT / entry, num_workers=None)
-    # Delete all files corresponding to the keys in invalid_file_reason_map
+
+    # Move invalid files to the INVALID_ROOT directory
     for invalid_file in invalid_file_reason_map.keys():
-        file_path = AUDIO_ROOT / entry / invalid_file
-        file_path.unlink(missing_ok=True)
+        invalid_file_path = AUDIO_ROOT / entry / invalid_file
+        invalid_file_path.rename(INVALID_ROOT / entry / invalid_file)
+
     invalid_stems = set([invalid_item[1:].rstrip(".wav") for invalid_item in list(invalid_file_reason_map.keys())])
     valid_and_existing_stems = intersection_stems - invalid_stems
     logger.info(f"Invalid file check for {entry} completed.")
+
     logger.info(f"In {metafile.name}:")
     logger.info(f"	Found {len(unique_stems)} audio files.")
     logger.info(f"	Downloaded {len(valid_and_existing_stems)} valid audio files.")
     logger.info(
         f"	Missing {len(unique_stems - valid_and_existing_stems)} audio files, missing rate: {len(unique_stems - valid_and_existing_stems) / len(unique_stems):.2%}"
     )
+
     with open(MISSING_ROOT / f"{entry}.txt", "w") as f:
         for stem in unique_stems - valid_and_existing_stems:
             f.write(f"{stem}.wav\n")
     logger.info(f"Recorded missing audio files for {entry} to {MISSING_ROOT / f'{entry}.txt'}")
+
     _rename_audios_in_directory(AUDIO_ROOT / entry)
+    
     logger.info(f"Audio files for {entry} have been extracted to {AUDIO_ROOT / entry}")
