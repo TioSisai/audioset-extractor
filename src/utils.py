@@ -79,11 +79,6 @@ def _proc_single_archive(archive_path: str | Path, left_strip: int = 1) -> dict[
                 if line.endswith(".wav"):
                     # 7z output is fixed-width, filename is in the last part
                     innerfile = line.split()[-1]
-                    filesize = int(line.split()[-3])
-                    # Skip files smaller than 1KB
-                    if filesize < 1000:
-                        pbar.update(1)
-                        continue
                     # Core logic: extract filename stem from the inner file path.
                     # Example: "folder/audio_01.wav" -> "audio_01"
                     # left_strip is used to remove specific characters from the beginning of the stem.
@@ -312,8 +307,8 @@ def _rename_audios_in_directory(directory: Path) -> None:
 
 def _check_audio_file_worker(
     audio_file: Path,
-    min_duration: float,
-    silence_db_threshold: float
+    min_duration: float = None,
+    silence_db_threshold: float = None
 ) -> Union[Tuple[str, str], None]:
     """
     Worker function to check a single audio file.
@@ -338,10 +333,14 @@ def _check_audio_file_worker(
 
         # Check 2: Duration
         duration = float(data.get("format", {}).get("duration", "0"))
-        if duration < min_duration:
-            reason = f"Duration too short: {duration:.2f}s"
-            logger.debug(f"'{audio_file.name}' failed duration check. Reason: {reason}")
-            return (audio_file.name, reason)
+        if min_duration is not None:
+            if duration < min_duration:
+                reason = f"Duration too short or emptly file: {duration:.2f}s"
+                logger.debug(f"'{audio_file.name}' failed duration check. Reason: {reason}")
+                return (audio_file.name, reason)
+        else:
+            if duration == 0:
+                return (audio_file.name, "File is empty")
 
         # Check 3 (Strict): Validate container and codec
         format_name = data.get("format", {}).get("format_name", "")
@@ -366,31 +365,32 @@ def _check_audio_file_worker(
         raise
 
     # --- Step 2: Silence detection using ffmpeg's volumedetect ---
-    try:
-        command_volume = [
-            "ffmpeg", "-i", str(audio_file), "-af", "volumedetect",
-            "-vn", "-f", "null", "-",
-        ]
-        result_volume = subprocess.run(
-            command_volume, capture_output=True, text=True, encoding="utf-8"
-        )
-        output = result_volume.stderr
+    if silence_db_threshold is not None:
+        try:
+            command_volume = [
+                "ffmpeg", "-i", str(audio_file), "-af", "volumedetect",
+                "-vn", "-f", "null", "-",
+            ]
+            result_volume = subprocess.run(
+                command_volume, capture_output=True, text=True, encoding="utf-8"
+            )
+            output = result_volume.stderr
 
-        max_volume_match = re.search(r"max_volume:\s*(-?[\d\.]+) dB", output)
-        if not max_volume_match:
-            reason = "Could not determine max_volume"
-            logger.warning(f"'{audio_file.name}' failed volume detection. Reason: {reason}")
-            return (audio_file.name, reason)
+            max_volume_match = re.search(r"max_volume:\s*(-?[\d\.]+) dB", output)
+            if not max_volume_match:
+                reason = "Could not determine max_volume"
+                logger.warning(f"'{audio_file.name}' failed volume detection. Reason: {reason}")
+                return (audio_file.name, reason)
 
-        max_volume = float(max_volume_match.group(1))
-        if max_volume < silence_db_threshold:
-            reason = f"Silent file: max_volume is {max_volume:.1f} dB"
-            logger.debug(f"'{audio_file.name}' failed silence check. Reason: {reason}")
-            return (audio_file.name, reason)
+            max_volume = float(max_volume_match.group(1))
+            if max_volume < silence_db_threshold:
+                reason = f"Silent file: max_volume is {max_volume:.1f} dB"
+                logger.debug(f"'{audio_file.name}' failed silence check. Reason: {reason}")
+                return (audio_file.name, reason)
 
-    except FileNotFoundError:
-        logger.error("ffmpeg command not found. Please ensure ffmpeg is installed in your PATH.")
-        raise
+        except FileNotFoundError:
+            logger.error("ffmpeg command not found. Please ensure ffmpeg is installed in your PATH.")
+            raise
 
     # All checks passed
     return None
@@ -523,8 +523,8 @@ def _prepare_all_pickles():
 def _invalid_directory(
     directory_path: Union[str, Path],
     num_workers: int = None,
-    min_duration: float = 0.05,
-    silence_db_threshold: float = -85.0
+    min_duration: float = None,
+    silence_db_threshold: float = None
 ) -> Dict[str, str]:
     """
     Checks all .wav files in a directory in parallel.
@@ -576,7 +576,7 @@ def _invalid_directory(
 
 # ============================== Public API ==============================
 
-def process_entry(entry: str) -> None:
+def process_entry(entry: str, num_workers: int = None, min_duration: float = None, silence_db_threshold: float = None):
     """
     Processes a specified dataset entry from start to finish.
 
@@ -596,6 +596,9 @@ def process_entry(entry: str) -> None:
         entry: The name of the dataset partition to process. Valid options include:
                "weak_unbalanced_train", "weak_balanced_train", "weak_eval",
                "strong_train", "strong_eval".
+        num_workers: Number of worker processes to use for parallel processing. Defaults to the number of CPU cores.
+        min_duration: Minimum required duration for audio files in seconds. If None, check only for empty files.
+        silence_db_threshold: The noise tolerance in dB for silence detection. If None, no silence check is performed.
     """
     assert entry in [
         "weak_unbalanced_train",
@@ -637,12 +640,14 @@ def process_entry(entry: str) -> None:
     logger.info(f"Extraction for {entry} completed.")
 
     logger.info(f"Starting to check invalid or broken audio files for {entry}...")
-    invalid_file_reason_map: dict = _invalid_directory(AUDIO_ROOT / entry, num_workers=None)
+    invalid_file_reason_map: dict = _invalid_directory(AUDIO_ROOT / entry, num_workers=num_workers,
+                                                       min_duration=min_duration,
+                                                       silence_db_threshold=silence_db_threshold)
 
     # Move invalid files to the INVALID_ROOT directory
     for invalid_file in invalid_file_reason_map.keys():
         invalid_file_path = AUDIO_ROOT / entry / invalid_file
-        invalid_file_path.rename(INVALID_ROOT / entry / invalid_file)
+        invalid_file_path.rename(INVALID_ROOT / entry / invalid_file[1:])
 
     invalid_stems = set([invalid_item[1:].rstrip(".wav") for invalid_item in list(invalid_file_reason_map.keys())])
     valid_and_existing_stems = intersection_stems - invalid_stems
@@ -661,5 +666,5 @@ def process_entry(entry: str) -> None:
     logger.info(f"Recorded missing audio files for {entry} to {MISSING_ROOT / f'{entry}.txt'}")
 
     _rename_audios_in_directory(AUDIO_ROOT / entry)
-    
+
     logger.info(f"Audio files for {entry} have been extracted to {AUDIO_ROOT / entry}")
