@@ -11,6 +11,7 @@ from collections import defaultdict
 from pathlib import Path
 import json
 import re
+import os
 from multiprocessing import Pool, cpu_count
 from typing import Union, Dict, Tuple
 from functools import partial
@@ -43,7 +44,7 @@ _initialize_directories()
 
 
 # ============================== Private Implementations ==============================
-def _proc_single_archive(archive_path: str | Path, left_strip: int | None = None) -> dict[str, tuple[str, str]]:
+def _proc_single_archive(archive_path: str | Path, left_strip: int = 1) -> dict[str, tuple[str, str]]:
     """
     Lists .wav files within an archive using p7zip.
 
@@ -145,24 +146,116 @@ def _proc_single_archive(archive_path: str | Path, left_strip: int | None = None
 #     logger.info(f"Successfully extracted {extracted_cnt} audio files.")
 
 
-def _extract_files(stem_to_archive_and_innerfile: dict[str, tuple[str, str]], stems: list[str], entry: str) -> None:
+# def _extract_files(stem_to_archive_and_innerfile: dict[str, tuple[str, str]], stems: list[str], entry: str) -> None:
+#     """
+#     Batch extracts specified audio files from archives.
+#     This version is optimized to group extractions by archive to reduce process overhead.
+
+#     Args:
+#         stem_to_archive_and_innerfile: Dictionary mapping file stems to (archive path, inner file path) tuples.
+#         stems: List of stems of audio files to extract.
+#         entry: Entry name used to create the target subdirectory (e.g., "strong_train").
+
+#     Raises:
+#         KeyError: If a stem in `stems` does not exist in the mapping dictionary.
+#         FileNotFoundError: If the 7z command-line tool is not installed.
+#         subprocess.CalledProcessError: If the 7z extraction command fails.
+#     """
+#     logger.info("Starting audio file extraction...")
+
+#     # 1. Group files to be extracted by their source archive
+#     archive_to_innerfiles: dict[Path, list[str]] = defaultdict(list)
+#     for stem in stems:
+#         try:
+#             archive_path_in_root, innerfile = stem_to_archive_and_innerfile[stem]
+#             abs_archive_path = ZIP_ROOT / archive_path_in_root
+#             archive_to_innerfiles[abs_archive_path].append(innerfile)
+#         except KeyError:
+#             logger.warning(f"Stem '{stem}' not found in the mapping. Skipping.")
+#             continue
+
+#     # 2. Create target directory
+#     target_dir = AUDIO_ROOT / entry
+#     target_dir.mkdir(parents=True, exist_ok=True)
+
+#     # 3. Execute one 7z command per archive
+#     extracted_cnt = 0
+#     for abs_archive_path, innerfiles in archive_to_innerfiles.items():
+#         # The -o switch must not have a space between it and the path.
+#         output_dir_switch = f"-o{target_dir}"
+#         cmds = ["7z", "e", str(abs_archive_path), output_dir_switch] + innerfiles
+
+#         try:
+#             subprocess.run(cmds, check=True)
+#             extracted_cnt += len(innerfiles)
+#         except subprocess.CalledProcessError as e:
+#             logger.error(
+#                 f"Failed to extract files from {abs_archive_path.name}. Return code: {e.returncode}. Error: {e.stderr}"
+#             )
+#             raise
+#         except FileNotFoundError:
+#             logger.error("7z command not found, please ensure p7zip is installed.")
+#             raise FileNotFoundError("Please install the 7z command-line tool (p7zip).")
+
+#     logger.info(f"Successfully extracted {extracted_cnt} audio files.")
+
+
+def _extract_worker(abs_archive_path: Path, innerfiles: list[str], target_dir: Path) -> tuple[int, str | None]:
     """
-    Batch extracts specified audio files from archives.
-    This version is optimized to group extractions by archive to reduce process overhead.
+    Worker Function: Extracts files from a single archive.
+    This function is designed to be called by multiprocessing.Pool.
 
     Args:
-        stem_to_archive_and_innerfile: Dictionary mapping file stems to (archive path, inner file path) tuples.
+        abs_archive_path (Path): The absolute path to the archive.
+        innerfiles (list[str]): A list of files to be extracted from this archive.
+        target_dir (Path): The target directory for file extraction.
+
+    Returns:
+        A tuple containing (number of successfully extracted files, error message or None).
+    """
+    # The -y parameter automatically answers "yes" to all 7z prompts, preventing the process from hanging.
+    output_dir_switch = f"-o{target_dir}"
+    cmds = ["7z", "e", str(abs_archive_path), output_dir_switch, "-y"] + innerfiles
+
+    try:
+        # Using capture_output=True captures stdout and stderr for easier debugging.
+        subprocess.run(cmds, check=True, capture_output=True, text=True, encoding='utf-8')
+        return (len(innerfiles), None)
+    except FileNotFoundError:
+        # This error is fatal and the same for all worker processes.
+        return (0, "Error: 7z command not found. Please ensure p7zip (or 7-Zip) is installed and in the system PATH.")
+    except subprocess.CalledProcessError as e:
+        # Catch extraction failure errors and return detailed information.
+        error_msg = (
+            f"Extraction from {abs_archive_path.name} failed. "
+            f"Return code: {e.returncode}. Stderr: {e.stderr.strip()}"
+        )
+        return (0, error_msg)
+
+
+def _extract_files(
+    stem_to_archive_and_innerfile: dict[str, tuple[str, str]],
+    stems: list[str],
+    entry: str,
+    num_processes: int | None = None
+) -> None:
+    """
+    Batch extracts specified audio files from archives in parallel using multiple processes.
+
+    Args:
+        stem_to_archive_and_innerfile: A dictionary mapping file stems to (archive path, inner file path) tuples.
         stems: List of stems of audio files to extract.
         entry: Entry name used to create the target subdirectory (e.g., "strong_train").
+        num_processes: Number of processes to use. If None, defaults to os.cpu_count().
 
     Raises:
-        KeyError: If a stem in `stems` does not exist in the mapping dictionary.
-        FileNotFoundError: If the 7z command-line tool is not installed.
-        subprocess.CalledProcessError: If the 7z extraction command fails.
+        # No longer actively throws exceptions, but logs errors to enhance robustness.
     """
-    logger.info("Starting audio file extraction...")
+    # Use os.cpu_count() to get the number of CPU cores as the default number of processes.
+    effective_processes = num_processes or os.cpu_count()
+    logger.info(f"Starting audio file extraction... Will use {effective_processes} processes.")
 
-    # 1. Group files to be extracted by their source archive
+    # 1. Group files to be extracted by their source archive (logic unchanged).
     archive_to_innerfiles: dict[Path, list[str]] = defaultdict(list)
     for stem in stems:
         try:
@@ -170,33 +263,46 @@ def _extract_files(stem_to_archive_and_innerfile: dict[str, tuple[str, str]], st
             abs_archive_path = ZIP_ROOT / archive_path_in_root
             archive_to_innerfiles[abs_archive_path].append(innerfile)
         except KeyError:
-            logger.warning(f"Stem '{stem}' not found in the mapping. Skipping.")
+            logger.warning(f"Stem '{stem}' not found in the mapping, skipping.")
             continue
 
-    # 2. Create target directory
+    if not archive_to_innerfiles:
+        logger.info("No files to extract.")
+        return
+
+    # 2. Create target directory (logic unchanged).
     target_dir = AUDIO_ROOT / entry
     target_dir.mkdir(parents=True, exist_ok=True)
 
-    # 3. Execute one 7z command per archive
-    extracted_cnt = 0
-    for abs_archive_path, innerfiles in archive_to_innerfiles.items():
-        # The -o switch must not have a space between it and the path.
-        output_dir_switch = f"-o{target_dir}"
-        cmds = ["7z", "e", str(abs_archive_path), output_dir_switch] + innerfiles
+    # 3. Prepare task list for the multiprocessing pool.
+    # Each task is a tuple containing (archive path, file list, target directory).
+    tasks = [
+        (abs_archive_path, innerfiles, target_dir)
+        for abs_archive_path, innerfiles in archive_to_innerfiles.items()
+    ]
 
-        try:
-            subprocess.run(cmds, check=True)
-            extracted_cnt += len(innerfiles)
-        except subprocess.CalledProcessError as e:
-            logger.error(
-                f"Failed to extract files from {abs_archive_path.name}. Return code: {e.returncode}. Error: {e.stderr}"
-            )
-            raise
-        except FileNotFoundError:
-            logger.error("7z command not found, please ensure p7zip is installed.")
-            raise FileNotFoundError("Please install the 7z command-line tool (p7zip).")
+    # 4. Execute extraction tasks in parallel using a process pool.
+    total_extracted_cnt = 0
+    failed_archives_cnt = 0
 
-    logger.info(f"Successfully extracted {extracted_cnt} audio files.")
+    # Use a with statement to ensure the process pool is properly closed.
+    with Pool(processes=num_processes) as pool:
+        # pool.starmap unpacks each tuple in the tasks list as arguments to _extract_worker.
+        results = pool.starmap(_extract_worker, tasks)
+
+    # 5. Process and summarize the return results of all processes.
+    for count, error_msg in results:
+        if error_msg:
+            logger.error(error_msg)
+            failed_archives_cnt += 1
+        else:
+            total_extracted_cnt += count
+
+    # 6. Final log summary.
+    logger.info(f"Successfully extracted {total_extracted_cnt} audio files.")
+    if failed_archives_cnt > 0:
+        logger.warning(
+            f"There were {failed_archives_cnt} archives that failed to extract. Please check the error logs above.")
 
 
 def _rename_audios_in_directory(directory: Path) -> None:
@@ -219,11 +325,11 @@ def _check_audio_file_worker(
     Returns:
         A tuple (filename, reason_string) if any check fails, otherwise None.
     """
-    # 检查文件是否存在
+    # Check if the file exists
     if not audio_file.exists():
         return (audio_file.name, "File not found")
 
-    # --- 步骤 1: 使用 ffprobe 进行元数据验证 ---
+    # --- Step 1: Metadata validation using ffprobe ---
     try:
         command_info = [
             "ffprobe", "-v", "quiet", "-print_format", "json",
@@ -234,14 +340,14 @@ def _check_audio_file_worker(
         )
         data = json.loads(result_info.stdout)
 
-        # 检查 2: 时长
+        # Check 2: Duration
         duration = float(data.get("format", {}).get("duration", "0"))
         if duration < min_duration:
             reason = f"Duration too short: {duration:.2f}s"
             logger.debug(f"'{audio_file.name}' failed duration check. Reason: {reason}")
             return (audio_file.name, reason)
 
-        # 检查 3 (严谨): 验证容器和编码
+        # Check 3 (Strict): Validate container and codec
         format_name = data.get("format", {}).get("format_name", "")
         audio_stream = next((s for s in data.get("streams", []) if s.get("codec_type") == "audio"), None)
         codec_name = audio_stream.get("codec_name", "") if audio_stream else ""
@@ -263,7 +369,7 @@ def _check_audio_file_worker(
         logger.error("ffprobe command not found. Please ensure ffmpeg is installed in your PATH.")
         raise
 
-    # --- 步骤 2: 使用 ffmpeg 的 volumedetect 进行静音检测 ---
+    # --- Step 2: Silence detection using ffmpeg's volumedetect ---
     try:
         command_volume = [
             "ffmpeg", "-i", str(audio_file), "-af", "volumedetect",
@@ -290,7 +396,7 @@ def _check_audio_file_worker(
         logger.error("ffmpeg command not found. Please ensure ffmpeg is installed in your PATH.")
         raise
 
-    # 所有检查通过
+    # All checks passed
     return None
 
 
@@ -421,8 +527,8 @@ def _prepare_all_pickles():
 def _invalid_directory(
     directory_path: Union[str, Path],
     num_workers: int = None,
-    min_duration: float = 0.5,
-    silence_db_threshold: float = -60.0
+    min_duration: float = 0.05,
+    silence_db_threshold: float = -85.0
 ) -> Dict[str, str]:
     """
     Checks all .wav files in a directory in parallel.
@@ -461,7 +567,7 @@ def _invalid_directory(
     with Pool(processes=workers) as pool:
         results_iterator = pool.imap_unordered(worker_func, files_to_check)
 
-        for result in tqdm(results_iterator, total=len(files_to_check), desc="Validating files"):
+        for result in tqdm.tqdm(results_iterator, total=len(files_to_check), desc="Validating files"):
             if result is not None:
                 filename, reason = result
                 failed_files_map[filename] = reason
@@ -476,17 +582,24 @@ def _invalid_directory(
 
 def process_entry(entry: str) -> None:
     """
-    Processes the specified dataset entry.
+    Processes a specified dataset entry from start to finish.
 
-    This process includes:
-    1. Ensuring all metadata files are downloaded.
-    2. Preparing a mapping (pickle file) containing paths to all audio files within archives.
-    3. Reading metadata for the specified entry to get the list of required audio file stems.
-    4. Comparing the required list with the available list, logging and reporting missing files.
-    5. Extracting all available audio files from archives to the specified directory.
+    This comprehensive process involves the following steps:
+    1.  Ensures all required metadata files (e.g., CSVs, TSVs) are downloaded from their sources.
+    2.  Prepares a mapping from audio file stems to their location within archive files.
+        This mapping is cached in a pickle file for efficiency.
+    3.  Reads the metadata corresponding to the specified `entry` to determine the list of required audio files.
+    4.  Extracts the required and available audio files from their respective archives into a dedicated directory.
+    5.  Validates the extracted audio files, checking for corruption, incorrect formats, minimum duration, and silence.
+        Problematic files are identified and subsequently deleted.
+    6.  Calculates and logs a summary, detailing the number of required, found, and missing audio files.
+    7.  Saves a list of missing file stems to a text file for later review.
+    8.  Performs a final renaming operation on the extracted audio files to standardize their names.
 
     Args:
-        entry: Name of the processing option, e.g., "weak_unbalanced_train", "weak_balanced_train", "weak_eval", "strong_train", "strong_eval".
+        entry: The name of the dataset partition to process. Valid options include:
+               "weak_unbalanced_train", "weak_balanced_train", "weak_eval",
+               "strong_train", "strong_eval".
     """
     assert entry in [
         "weak_unbalanced_train",
@@ -525,16 +638,22 @@ def process_entry(entry: str) -> None:
     logger.info(f"Extraction for {entry} completed.")
     logger.info(f"Starting to check invalid or broken audio files for {entry}...")
     invalid_file_reason_map: dict = _invalid_directory(AUDIO_ROOT / entry, num_workers=None)
+    # Delete all files corresponding to the keys in invalid_file_reason_map
+    for invalid_file in invalid_file_reason_map.keys():
+        file_path = AUDIO_ROOT / entry / invalid_file
+        file_path.unlink(missing_ok=True)
+    invalid_stems = set([invalid_item[1:].rstrip(".wav") for invalid_item in list(invalid_file_reason_map.keys())])
+    valid_and_existing_stems = intersection_stems - invalid_stems
     logger.info(f"Invalid file check for {entry} completed.")
-    # logger.info(f"In {metafile.name}:")
-    # logger.info(f"	Found {len(unique_stems)} audio files.")
-    # logger.info(f"	Downloaded {len(intersection_stems)} audio files.")
-    # logger.info(
-    #     f"	Missing {len(unique_stems - intersection_stems)} audio files, missing rate: {len(unique_stems - intersection_stems) / len(unique_stems):.2%}"
-    # )
-    # with open(MISSING_ROOT / f"{entry}.txt", "w") as f:
-    #     for stem in unique_stems - intersection_stems:
-    #         f.write(f"{stem}.wav\n")
-    # logger.info(f"Recorded missing audio files for {entry} to {MISSING_ROOT / f'{entry}.txt'}")
-    # _rename_audios_in_directory(AUDIO_ROOT / entry)
-    # logger.info(f"Audio files for {entry} have been extracted to {AUDIO_ROOT / entry}")
+    logger.info(f"In {metafile.name}:")
+    logger.info(f"	Found {len(unique_stems)} audio files.")
+    logger.info(f"	Downloaded {len(valid_and_existing_stems)} valid audio files.")
+    logger.info(
+        f"	Missing {len(unique_stems - valid_and_existing_stems)} audio files, missing rate: {len(unique_stems - valid_and_existing_stems) / len(unique_stems):.2%}"
+    )
+    with open(MISSING_ROOT / f"{entry}.txt", "w") as f:
+        for stem in unique_stems - valid_and_existing_stems:
+            f.write(f"{stem}.wav\n")
+    logger.info(f"Recorded missing audio files for {entry} to {MISSING_ROOT / f'{entry}.txt'}")
+    _rename_audios_in_directory(AUDIO_ROOT / entry)
+    logger.info(f"Audio files for {entry} have been extracted to {AUDIO_ROOT / entry}")
