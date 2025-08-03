@@ -669,7 +669,7 @@ def process_entry(entry: str, num_workers: int = None, min_duration: float = Non
         invalid_file_path = AUDIO_ROOT / entry / invalid_file
         invalid_file_path.rename(INVALID_ROOT / entry / invalid_file)
 
-    invalid_stems = set([invalid_item.rstrip(".wav") for invalid_item in list(invalid_file_reason_map.keys())])
+    invalid_stems = set([Path(invalid_item).stem for invalid_item in list(invalid_file_reason_map.keys())])
     valid_and_existing_stems = intersection_stems - invalid_stems
     logger.info(f"Invalid file check for {entry} completed.")
 
